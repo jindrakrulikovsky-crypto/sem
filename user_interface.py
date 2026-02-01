@@ -1,80 +1,42 @@
 from database_manager import DatabaseManager
-import json
 import os
 import sys
-import time
+import getpass
 
 class UserInterface:
     def __init__(self):
-        self.login_attempts_file = "login_attempts.json"
         self.max_attempts = 3
         self.db = DatabaseManager()
-        self.login_attempts = self._load_attempts()
-    
-    def _load_attempts(self):
-        try:
-            with open(self.login_attempts_file, 'r') as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
-    
-    def _save_attempts(self):
-        with open(self.login_attempts_file, 'w') as f:
-            json.dump(self.login_attempts, f)
 
     def cmd_register(self, username, password):
-        if self.db.register_user(username, password):
+        success, message = self.db.register_user(username, password)
+        if success:
             print(f"Registered user '{username}'")
             return 0
-        print(f"Username '{username}' is already taken")
+        print(f"Registration failed: {message}", file=sys.stderr)
         return 1
 
 
     def cmd_login(self, username, password):
-        raw_data = self.login_attempts.get(username, {})
-        attempt_data = {"attempts": 0, "timestamp": 0}
-        attempt_data.update(raw_data)
-        attempts = attempt_data["attempts"]
-        timestamp = attempt_data["timestamp"]
-        
-        if attempts >= self.max_attempts:
-            time_locked = time.time() - timestamp
-            if time_locked < 60:
-                seconds_remaining = int(60 - time_locked)
-                print(f"Account '{username}' locked. Try again in {seconds_remaining} seconds", file=sys.stderr)
-                return 1
-            else:
-                self.login_attempts[username] = {"attempts": 0, "timestamp": 0}
-                self._save_attempts()
-                attempts = 0
-                timestamp = 0
+        is_locked, wait_time = self.db.get_lockout_status(username)
+        if is_locked:
+            print(f"Account '{username}' locked. Try again in {wait_time} seconds", file=sys.stderr)
+            return 1
         
         user_id = self.db.verify_login(username, password)
-
+        
         if user_id is not None:
+            self.db.handle_successful_login(username)
             print(f"Login OK (user_id={user_id})")
-            self.login_attempts[username] = {"attempts": 0, "timestamp": 0}
-            self._save_attempts()
             return 0
         
-        attempts += 1
-        if attempts >= self.max_attempts:
-            self.login_attempts[username] = {
-                "attempts": attempts,
-                "timestamp": time.time()
-            }
+        new_count = self.db.handle_failed_login(username)
+        if new_count >= self.max_attempts:
             print(f"Login failed: Account locked for 60 seconds", file=sys.stderr)
         else:
-            self.login_attempts[username] = {
-                "attempts": attempts,
-                "timestamp": 0
-            }
-            remaining = self.max_attempts - attempts
+            remaining = self.max_attempts - new_count
             print(f"Login failed: invalid credentials ({remaining} attempts remaining)", file=sys.stderr)
-        
-        self._save_attempts()
         return 1
-
 
     def cmd_check(self, username):
         exists = self.db.username_exists(username)
@@ -84,7 +46,7 @@ class UserInterface:
             print(f"Username '{username}' not found")
         return 0
 
-    def run_command(self, opts: dict) -> int:
+    def run_command(self, opts):
         cmd = opts["command"]
         if cmd == "register":
             return self.cmd_register(opts["username"], opts["password"])
@@ -99,14 +61,26 @@ def print_usage() -> None:
     script_name = os.path.basename(sys.argv[0])
     msg = (
         "Usage:\n"
-        f"  python {script_name} register <username> <password>\n"
-        f"  python {script_name} login <username> <password>\n"
+        f"  python {script_name} register <username>\n"
+        f"  python {script_name} login <username>\n"
         f"  python {script_name} check <username>\n"
     )
     print(msg, file=sys.stderr)
 
+def get_secure_password():
+    """
+    In interactive terminals, 
+    it uses getpass to hide keystrokes from the screen, 
+    while in non-interactive modes, 
+    it reads directly from standard input to support automation, 
+    ensuring passwords are never stored in unsafe shell history logs.
+    """
+    if sys.stdin.isatty():
+        return getpass.getpass("Enter password: ")
+    return sys.stdin.readline().strip()
 
-def parse_args(argv: list[str]) -> dict:
+
+def parse_args(argv: list[str]):
     args = list(argv)
     
     if not args:
@@ -117,18 +91,18 @@ def parse_args(argv: list[str]) -> dict:
     rest = args[1:]
 
     if command == "register":
-        if len(rest) != 2:
-            print("Error: register needs <username> <password>", file=sys.stderr)
+        if len(rest) != 1:
+            print("Error: register needs <username>", file=sys.stderr)
             print_usage()
             raise SystemExit(2)
-        return {"command": command, "username": rest[0], "password": rest[1]}
+        return {"command": command, "username": rest[0], "password": get_secure_password()}
 
     if command == "login":
-        if len(rest) != 2:
-            print("Error: login needs <username> <password>", file=sys.stderr)
+        if len(rest) != 1:
+            print("Error: login needs <username>", file=sys.stderr)
             print_usage()
             raise SystemExit(2)
-        return {"command": command, "username": rest[0], "password": rest[1]}
+        return {"command": command, "username": rest[0], "password": get_secure_password()}
 
     if command == "check":
         if len(rest) != 1:
